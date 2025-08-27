@@ -1,0 +1,14 @@
+# Web framework + server
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Browser automation
+playwright==1.54.0
+
+# Logging
+loguru==0.7.2
+
+# Data validation / models
+pydantic==2.9.2
+
+# CSV handling (standard library, but include pandas if needed later)
