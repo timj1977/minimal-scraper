@@ -15,7 +15,7 @@ if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:
         pass
-
+from fastapi.openapi.utils import get_openapi
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field, HttpUrl
@@ -25,6 +25,47 @@ from .state import new_run, update_run, get_run
 from .runner import scrape_append_to_csv, scrape_search_to_csv
 
 app = FastAPI(title="Minimal Scraper Orchestrator")
+# --- Swagger "Authorize" button for x-api-key ---
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=app.title if hasattr(app, "title") else "API",
+        version="1.0.0",
+        description="Minimal Scraper API",
+        routes=app.routes,
+    )
+
+    # Ensure components exists
+    openapi_schema.setdefault("components", {})
+    openapi_schema["components"].setdefault("securitySchemes", {})
+
+    # Declare x-api-key header scheme
+    openapi_schema["components"]["securitySchemes"]["ApiKeyAuth"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+    }
+
+    # Apply globally so the green "Authorize" shows up
+    openapi_schema["security"] = [{"ApiKeyAuth": []}]
+
+    app.openapi_schema = openapi_schema
+    return openapi_schema
+
+# Activate the custom OpenAPI
+app.openapi = custom_openapi  # noqa: E305
+# --- end Swagger "Authorize" patch ---
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --------- Models ---------
 
