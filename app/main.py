@@ -1,234 +1,222 @@
-# app/main.py
-from __future__ import annotations
-
+import os
 import uuid
 import asyncio
-import os
-import sys
-import traceback
 from datetime import datetime
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, Union
 
-# Windows needs the Proactor event loop for Playwright subprocesses
-if sys.platform.startswith("win"):
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
-from fastapi.openapi.utils import get_openapi
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel, Field, HttpUrl
-from loguru import logger
+from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+from fastapi.openapi.utils import get_openapi  # keep for Authorize button
+from app.runner import scrape_append_to_csv, scrape_search_to_csv
 
-from .state import new_run, update_run, get_run
-from .runner import scrape_append_to_csv, scrape_search_to_csv
 
-app = FastAPI(title="Minimal Scraper Orchestrator")
-# --- Swagger "Authorize" button for x-api-key ---
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
+# ---------------------------
+# Config / API key handling
+# ---------------------------
 
-    openapi_schema = get_openapi(
-        title=app.title if hasattr(app, "title") else "API",
-        version="1.0.0",
-        description="Minimal Scraper API",
-        routes=app.routes,
-    )
+API_KEY = os.getenv("SCRAPER_API_KEY", "").strip()
+if not API_KEY:
+    # still allow running without a key in dev, but warn in logs
+    print("WARNING: SCRAPER_API_KEY is not set; /docs and endpoints will be open")
 
-    # Ensure components exists
-    openapi_schema.setdefault("components", {})
-    openapi_schema["components"].setdefault("securitySchemes", {})
+app = FastAPI(title="Minimal Scraper", version="1.0.0")
 
-    # Declare x-api-key header scheme
-    openapi_schema["components"]["securitySchemes"]["ApiKeyAuth"] = {
-        "type": "apiKey",
-        "in": "header",
-        "name": "x-api-key",
-    }
+# Simple x-api-key guard
+async def require_api_key(x_api_key: Optional[str]) -> None:
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    # Apply globally so the green "Authorize" shows up
-    openapi_schema["security"] = [{"ApiKeyAuth": []}]
 
-    app.openapi_schema = openapi_schema
-    return openapi_schema
+# ---------------------------
+# Models
+# ---------------------------
 
-# Activate the custom OpenAPI
-app.openapi = custom_openapi  # noqa: E305
-# --- end Swagger "Authorize" patch ---
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --------- Models ---------
-
-class Selector(BaseModel):
+class SelectorField(BaseModel):
     name: str
     selector: str
-    type: Literal["text", "attr"] = "text"
+    type: Literal["text", "attr", "html"] = "text"
     attr: Optional[str] = None
 
 
 class SearchConfig(BaseModel):
+    # core search pieces
     input_selector: str
-    submit_selector: Optional[str] = None
+    submit_selector: str
     results_selector: Optional[str] = None
-    detail_ready_selector: Optional[str] = None
+    detail_ready_selector: str
     back_to_search_selector: Optional[str] = None
 
+    # NEW: disclaimer support
+    disclaimer_selector: Optional[str] = None
+    disclaimer_click_each: bool = False
 
-class RunRequest(BaseModel):
-    mode: Literal["append", "search"] = "append"
 
-    # Common
-    input_list: List[str] = Field(..., min_items=1)
-    selectors: List[Selector] = Field(..., min_items=1)
-
-    # Mode A
-    base_url: Optional[HttpUrl | str] = None
-
-    # Mode B
-    start_url: Optional[HttpUrl | str] = None
-    search: Optional[SearchConfig] = None
-
-    # runtime
+class AppendPayload(BaseModel):
+    mode: Literal["append"] = Field("append", frozen=True)
+    base_url: str
+    input_list: List[str]
+    selectors: List[SelectorField]
     headless: bool = True
-    delay_ms_min: int = 300
-    delay_ms_max: int = 900
-    timeout_ms: int = 30000
+    delay_ms_min: int = 200
+    delay_ms_max: int = 500
+    timeout_ms: int = 20000
 
 
-class RunResponse(BaseModel):
-    run_id: str
-    status: str
+class SearchPayload(BaseModel):
+    mode: Literal["search"] = Field("search", frozen=True)
+    start_url: str
+    input_list: List[str]
+    selectors: List[SelectorField]
+    search: SearchConfig
+    headless: bool = True
+    delay_ms_min: int = 200
+    delay_ms_max: int = 500
+    timeout_ms: int = 20000
 
 
-# --------- Debug/env ---------
+RunRequest = Union[AppendPayload, SearchPayload]
 
-@app.get("/env", response_class=PlainTextResponse)
-def env():
-    lines = []
-    lines.append(f"sys.executable = {sys.executable}")
-    lines.append(f"sys.prefix     = {sys.prefix}")
+
+class RunStatus(BaseModel):
+    id: str
+    status: Literal["queued", "running", "done", "error"]
+    created_at: str
+    finished_at: Optional[str] = None
+    stats: Dict[str, int] = {"total": 0, "ok": 0, "err": 0}
+    error: str = ""
+    output_path: Optional[str] = None
+    payload: Dict[str, Any] = {}
+
+
+# ---------------------------
+# In-memory run registry
+# ---------------------------
+
+RUNS: Dict[str, RunStatus] = {}
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+async def _do(run_id: str, payload: RunRequest):
+    st = RUNS[run_id]
+    st.status = "running"
+    RUNS[run_id] = st
+
     try:
-        import playwright  # type: ignore
-        from importlib.metadata import version, PackageNotFoundError
-        try:
-            pv = version("playwright")
-        except PackageNotFoundError:
-            pv = "unknown"
-        lines.append(f"playwright.version  = {pv}")
-        lines.append(f"playwright.__file__ = {getattr(playwright, '__file__', None)}")
+        if isinstance(payload, AppendPayload):
+            output_path, total, ok, err = await scrape_append_to_csv(
+                base_url=payload.base_url,
+                input_list=payload.input_list,
+                selectors=[s.model_dump() for s in payload.selectors],
+                headless=payload.headless,
+                delay_ms_min=payload.delay_ms_min,
+                delay_ms_max=payload.delay_ms_max,
+                timeout_ms=payload.timeout_ms,
+            )
+        else:
+            # IMPORTANT: pass the entire search object as a single argument
+            output_path, total, ok, err = await scrape_search_to_csv(
+                start_url=payload.start_url,
+                input_list=payload.input_list,
+                selectors=[s.model_dump() for s in payload.selectors],
+                search=payload.search.model_dump(),
+                headless=payload.headless,
+                delay_ms_min=payload.delay_ms_min,
+                delay_ms_max=payload.delay_ms_max,
+                timeout_ms=payload.timeout_ms,
+            )
+
+        st.status = "done"
+        st.output_path = output_path
+        st.stats = {"total": total, "ok": ok, "err": err}
     except Exception as e:
-        lines.append(f"playwright import failed: {type(e).__name__}: {e}")
-    lines.append("PYTHONHOME=" + str(os.environ.get("PYTHONHOME")))
-    lines.append("PYTHONPATH=" + str(os.environ.get("PYTHONPATH")))
-    return "\n".join(lines)
+        st.status = "error"
+        st.error = f"{type(e).__name__}: {e}\n" \
+                   f"sys.executable={os.sys.executable}\n" \
+                   f"sys.prefix={os.sys.prefix}\n" \
+                   f"PYTHONHOME={os.getenv('PYTHONHOME')}\n" \
+                   f"PYTHONPATH={os.getenv('PYTHONPATH')}\n"
+    finally:
+        st.finished_at = _now_iso()
+        RUNS[run_id] = st
 
 
-# --------- API ---------
+# ---------------------------
+# Routes
+# ---------------------------
 
 @app.get("/healthz")
-def healthz():
+async def healthz():
     return {"ok": True}
 
 
-@app.post("/run", response_model=RunResponse)
-async def run_job(req: RunRequest):
-    if req.mode == "append":
-        if not req.base_url:
-            raise HTTPException(422, "base_url is required for mode='append'")
-    elif req.mode == "search":
-        if not (req.start_url and req.search and req.search.input_selector):
-            raise HTTPException(422, "start_url and search.input_selector are required for mode='search'")
-    else:
-        raise HTTPException(422, "Unsupported mode")
+@app.post("/run", response_model=RunStatus)
+async def create_run(payload: RunRequest, x_api_key: Optional[str] = Header(default=None)):
+    await require_api_key(x_api_key)
 
     run_id = str(uuid.uuid4())
-    new_run(run_id, payload=req.dict())
-    update_run(run_id, status="running")
-    logger.info(f"Run {run_id} started (mode={req.mode})")
+    st = RunStatus(
+        id=run_id,
+        status="queued",
+        created_at=_now_iso(),
+        payload=payload.model_dump(),
+    )
+    RUNS[run_id] = st
 
-    async def _do():
-        try:
-            if req.mode == "append":
-                output_path, total, ok, err = await scrape_append_to_csv(
-                    base_url=str(req.base_url),
-                    input_list=req.input_list,
-                    selectors=[s.dict() for s in req.selectors],
-                    headless=req.headless,
-                    delay_ms_min=req.delay_ms_min,
-                    delay_ms_max=req.delay_ms_max,
-                    timeout_ms=req.timeout_ms,
-                    run_id=run_id,
-                )
-            else:
-                s = req.search  # type: ignore[assignment]
-                output_path, total, ok, err = await scrape_search_to_csv(
-                    start_url=str(req.start_url),
-                    input_list=req.input_list,
-                    selectors=[sel.dict() for sel in req.selectors],
-                    input_selector=s.input_selector,                   # type: ignore[arg-type]
-                    submit_selector=s.submit_selector,                 # type: ignore[arg-type]
-                    results_selector=s.results_selector,               # type: ignore[arg-type]
-                    detail_ready_selector=s.detail_ready_selector,     # type: ignore[arg-type]
-                    back_to_search_selector=s.back_to_search_selector, # type: ignore[arg-type]
-                    headless=req.headless,
-                    delay_ms_min=req.delay_ms_min,
-                    delay_ms_max=req.delay_ms_max,
-                    timeout_ms=req.timeout_ms,
-                    run_id=run_id,
-                )
+    # kick off task
+    asyncio.create_task(_do(run_id, payload))
 
-            if not os.path.exists(output_path):
-                raise RuntimeError("CSV not found after run")
-
-            update_run(
-                run_id,
-                status="done",
-                finished_at=datetime.utcnow().isoformat(),
-                stats={"total": total, "ok": ok, "err": err},
-                output_path=output_path,
-            )
-            logger.info(f"Run {run_id} done: {ok}/{total} ok")
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            err_msg = f"{type(e).__name__}: {e}".strip()
-            env_lines = [
-                f"sys.executable={sys.executable}",
-                f"sys.prefix={sys.prefix}",
-                "PYTHONHOME=" + str(os.environ.get("PYTHONHOME")),
-                "PYTHONPATH=" + str(os.environ.get("PYTHONPATH")),
-            ]
-            error_blob = err_msg + "\n" + "\n".join(env_lines) + "\n" + (tb[:3000] + ("..." if len(tb) > 3000 else ""))
-            logger.exception(f"Run {run_id} error: {err_msg}")
-            update_run(run_id, status="error", finished_at=datetime.utcnow().isoformat(), error=error_blob)
-
-    asyncio.create_task(_do())
-    return RunResponse(run_id=run_id, status="running")
+    return RUNS[run_id]
 
 
-@app.get("/runs/{run_id}")
-def runs_status(run_id: str):
-    info = get_run(run_id)
-    if not info:
-        raise HTTPException(404, "run not found")
-    return info
+@app.get("/runs/{run_id}", response_model=RunStatus)
+async def runs_status(run_id: str, x_api_key: Optional[str] = Header(default=None)):
+    await require_api_key(x_api_key)
+    st = RUNS.get(run_id)
+    if not st:
+        raise HTTPException(404, "Run not found")
+    return st
 
 
 @app.get("/runs/{run_id}/download")
-def runs_download(run_id: str):
-    info = get_run(run_id)
-    if not info:
-        raise HTTPException(404, "run not found")
-    if info["status"] != "done" or not info["output_path"]:
-        raise HTTPException(409, "run not finished")
-    return FileResponse(path=info["output_path"], media_type="text/csv", filename=f"{run_id}.csv")
+async def runs_download(run_id: str, x_api_key: Optional[str] = Header(default=None)):
+    await require_api_key(x_api_key)
+    st = RUNS.get(run_id)
+    if not st:
+        raise HTTPException(404, "Run not found")
+    if st.status != "done" or not st.output_path:
+        raise HTTPException(400, "Run not completed or no output")
+    if not os.path.exists(st.output_path):
+        raise HTTPException(404, "Output file not found")
+    return FileResponse(st.output_path, filename=os.path.basename(st.output_path))
+
+
+# ---------------------------
+# Swagger: API key "Authorize" button
+# ---------------------------
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    )
+    # Define header-based API key
+    openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {}).update({
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "x-api-key",
+        }
+    })
+    # Apply globally
+    openapi_schema["security"] = [{"ApiKeyAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi  # type: ignore
